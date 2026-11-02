@@ -1,5 +1,6 @@
 mod adapter;
 mod db;
+mod mcp_plugins;
 mod protobuf;
 mod streaming;
 mod types;
@@ -563,11 +564,12 @@ async fn main() {
                 Vec::new()
             }
             Some("session/new") => {
+                let params = req.params.unwrap_or(json!({}));
                 let adapter = Arc::clone(&adapter); let out_tx = out_tx.clone();
                 pending_prompts += 1;
                 tokio::spawn(async move {
                     let mut adapter = adapter.lock().await;
-                    let _ = out_tx.send(Some(serde_json::to_string(&adapter.handle_session_new(id)).unwrap()));
+                    let _ = out_tx.send(Some(serde_json::to_string(&adapter.handle_session_new(id, &params)).unwrap()));
                     let _ = out_tx.send(None);
                 });
                 Vec::new()
@@ -629,6 +631,17 @@ async fn main() {
                 tokio::spawn(async move {
                     let mut adapter = adapter.lock().await;
                     let _ = out_tx.send(Some(serde_json::to_string(&adapter.handle_session_set_config_option(id, &params)).unwrap()));
+                    let _ = out_tx.send(None);
+                });
+                Vec::new()
+            }
+            Some("session/close") => {
+                let params = req.params.unwrap_or(json!({}));
+                let adapter = Arc::clone(&adapter); let out_tx = out_tx.clone();
+                pending_prompts += 1;
+                tokio::spawn(async move {
+                    let mut adapter = adapter.lock().await;
+                    let _ = out_tx.send(Some(serde_json::to_string(&adapter.handle_session_close(id, &params)).unwrap()));
                     let _ = out_tx.send(None);
                 });
                 Vec::new()
@@ -712,10 +725,13 @@ mod tests {
             sessions: HashMap::new(), working_dir: "/tmp".to_string(),
             conversations_dir: PathBuf::from("/tmp"), state_file: PathBuf::from("/tmp/sessions.json"),
             available_models: Some(vec![]),
+            mcp: mcp_plugins::PluginStore::detached(PathBuf::from("/tmp")),
         };
         let response = adapter.handle_initialize(json!(1));
-        assert_eq!(response.result.as_ref().and_then(|r| r.get("agentCapabilities"))
-            .and_then(|c| c.get("loadSession")).and_then(|v| v.as_bool()), Some(true));
+        let capabilities = response.result.as_ref().and_then(|r| r.get("agentCapabilities")).unwrap();
+        assert_eq!(capabilities.get("loadSession").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(capabilities["mcpCapabilities"]["http"], json!(true));
+        assert_eq!(capabilities["mcpCapabilities"]["sse"], json!(false));
     }
 
     #[test]
@@ -1068,6 +1084,7 @@ E0707 08:34:23.910604  84 log.go:398] agent executor error: model unreachable: R
             sessions: HashMap::new(), working_dir: root.to_string_lossy().to_string(),
             conversations_dir: root.join("conversations"), state_file: root.join("sessions.json"),
             available_models: Some(vec![]),
+            mcp: mcp_plugins::PluginStore::detached(root.clone()),
         };
         adapter.persist_session("sess-1", Some("conv-abc"), 5, None);
         let response = adapter.handle_session_load(json!(7), &json!({"sessionId": "sess-1"}));
@@ -1089,6 +1106,7 @@ E0707 08:34:23.910604  84 log.go:398] agent executor error: model unreachable: R
                 "Gemini 3.5 Flash (Low)".to_string(),
                 selected_model.to_string(),
             ]),
+            mcp: mcp_plugins::PluginStore::detached(root.clone()),
         };
         adapter.persist_session("sess-1", Some("conv-abc"), 5, Some(selected_model));
         let response = adapter.handle_session_load(json!(7), &json!({"sessionId": "sess-1"}));
@@ -1120,6 +1138,7 @@ E0707 08:34:23.910604  84 log.go:398] agent executor error: model unreachable: R
             sessions: HashMap::new(), working_dir: root.to_string_lossy().to_string(),
             conversations_dir: root.join("conversations"), state_file: root.join("sessions.json"),
             available_models: Some(vec![]),
+            mcp: mcp_plugins::PluginStore::detached(root.clone()),
         };
         adapter.persist_session("sess-1", Some("conv-abc"), 7, None);
         assert_eq!(adapter.restore_session("sess-1"), Some(("conv-abc".to_string(), 7, None)));

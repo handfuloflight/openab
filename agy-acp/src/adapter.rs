@@ -5,6 +5,7 @@ use std::fs;
 use std::path::PathBuf;
 use uuid::Uuid;
 
+use crate::mcp_plugins::{McpError, PluginStore};
 use crate::types::*;
 
 const DEFAULT_PRINT_TIMEOUT: &str = "20m";
@@ -46,6 +47,7 @@ pub struct Adapter {
     pub conversations_dir: PathBuf,
     pub state_file: PathBuf,
     pub available_models: Option<Vec<String>>,
+    pub mcp: PluginStore,
 }
 
 impl Adapter {
@@ -60,6 +62,7 @@ impl Adapter {
             conversations_dir: PathBuf::from(&home).join(".gemini/antigravity-cli/conversations"),
             state_file: state_dir.join("sessions.json"),
             available_models: None,
+            mcp: PluginStore::new(PathBuf::from(&home)),
         }
     }
 
@@ -263,6 +266,9 @@ impl Adapter {
         while self.sessions.len() >= MAX_SESSIONS {
             if let Some(key) = self.sessions.keys().next().cloned() {
                 self.sessions.remove(&key);
+                self.mcp.remove_session(&key);
+            } else {
+                break;
             }
         }
     }
@@ -290,14 +296,21 @@ impl Adapter {
             result: Some(json!({
                 "protocolVersion": 1,
                 "agentInfo": { "name": "agy", "version": env!("CARGO_PKG_VERSION") },
-                "agentCapabilities": { "streaming": true, "loadSession": true },
+                "agentCapabilities": {
+                    "streaming": true,
+                    "loadSession": true,
+                    "mcpCapabilities": { "http": true, "sse": false },
+                },
             })),
             error: None,
         }
     }
 
-    pub fn handle_session_new(&mut self, id: Value) -> JsonRpcResponse {
+    pub fn handle_session_new(&mut self, id: Value, params: &Value) -> JsonRpcResponse {
         let session_id = Uuid::new_v4().to_string();
+        if let Err(err) = self.apply_mcp_servers(&session_id, params) {
+            return mcp_error_response(id, err);
+        }
         self.evict_if_needed();
         self.sessions.insert(session_id.clone(), Session {
             conversation_id: None, last_step_idx: -1, model_id: None,
@@ -318,6 +331,9 @@ impl Adapter {
                 error: Some(json!({"code":-32602,"message":"missing sessionId"})) };
         }
         if self.restore_session_state(session_id) {
+            if let Err(err) = self.apply_mcp_servers(session_id, params) {
+                return mcp_error_response(id, err);
+            }
             let model_id = self.sessions.get(session_id).and_then(|s| s.model_id.clone());
             let config_options = self.config_options_json(model_id.as_deref());
             return JsonRpcResponse { jsonrpc: "2.0", id,
@@ -351,6 +367,30 @@ impl Adapter {
         self.persist_session(session_id, conv_id.as_deref(), last_step_idx, Some(&value));
         let config_options = self.config_options_json(Some(&value));
         JsonRpcResponse { jsonrpc: "2.0", id, result: Some(json!({ "configOptions": config_options })), error: None }
+    }
+
+    pub fn handle_session_close(&mut self, id: Value, params: &Value) -> JsonRpcResponse {
+        let session_id = params.get("sessionId").and_then(|v| v.as_str()).unwrap_or("");
+        if session_id.is_empty() {
+            return JsonRpcResponse { jsonrpc: "2.0", id, result: None,
+                error: Some(json!({"code": -32602, "message": "missing sessionId"})) };
+        }
+        let known = self.sessions.remove(session_id).is_some();
+        self.mcp.remove_session(session_id);
+        if !known {
+            return JsonRpcResponse { jsonrpc: "2.0", id, result: None,
+                error: Some(json!({"code": -32000, "message": format!("unknown sessionId: {session_id}")})) };
+        }
+        JsonRpcResponse { jsonrpc: "2.0", id, result: Some(json!({})), error: None }
+    }
+
+    fn apply_mcp_servers(&mut self, session_id: &str, params: &Value) -> Result<(), McpError> {
+        let servers = match params.get("mcpServers") {
+            None | Some(Value::Null) => Vec::new(),
+            Some(Value::Array(items)) => items.clone(),
+            Some(_) => return Err(McpError::invalid("mcpServers must be an array")),
+        };
+        self.mcp.sync(session_id, &servers).map(|_| ())
     }
 
     /// Gather session state needed for prompt execution (under lock).
@@ -403,6 +443,21 @@ impl Adapter {
     }
 }
 
+impl Drop for Adapter {
+    fn drop(&mut self) {
+        self.mcp.remove_all();
+    }
+}
+
+fn mcp_error_response(id: Value, err: McpError) -> JsonRpcResponse {
+    JsonRpcResponse {
+        jsonrpc: "2.0",
+        id,
+        result: None,
+        error: Some(json!({ "code": err.code(), "message": err.message() })),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -434,6 +489,7 @@ mod tests {
             conversations_dir: root.join("conversations"),
             state_file: root.join("sessions.json"),
             available_models: Some(vec![row.to_string(), legacy.to_string()]),
+            mcp: PluginStore::detached(root.to_path_buf()),
         };
         adapter.save_models_cache(adapter.available_models.as_ref().unwrap());
         adapter.available_models = adapter.load_cached_models();
@@ -477,8 +533,9 @@ mod tests {
             conversations_dir: root.join("conversations"),
             state_file: root.join("sessions.json"),
             available_models: Some(vec![row.to_string()]),
+            mcp: PluginStore::detached(root.to_path_buf()),
         };
-        let created = adapter.handle_session_new(json!(1));
+        let created = adapter.handle_session_new(json!(1), &json!({}));
         let session_id = created.result.unwrap()["sessionId"]
             .as_str()
             .unwrap()
@@ -592,5 +649,88 @@ mod tests {
             prompt_extra_args("--print-timeout '5m"),
             ["--print-timeout", "20m"]
         );
+    }
+
+    fn adapter_at(home: &std::path::Path) -> Adapter {
+        Adapter {
+            sessions: HashMap::new(),
+            working_dir: home.to_string_lossy().to_string(),
+            conversations_dir: home.join("conversations"),
+            state_file: home.join("sessions.json"),
+            available_models: Some(vec![]),
+            mcp: PluginStore::new(home.to_path_buf()),
+        }
+    }
+
+    #[test]
+    fn session_new_writes_plugin_and_close_removes_it() {
+        let root = TempDirGuard(std::env::temp_dir().join(format!("agy-acp-wire-{}", Uuid::new_v4())));
+        fs::create_dir_all(&*root).unwrap();
+        let mut adapter = adapter_at(&root);
+        let params = json!({
+            "mcpServers": [
+                {
+                    "name": "conduit",
+                    "command": "/bin/true",
+                    "args": ["--flag"],
+                    "env": [{"name": "TOKEN", "value": "env-secret-value"}]
+                },
+                {
+                    "type": "http",
+                    "name": "remote",
+                    "url": "http://127.0.0.1:9/mcp",
+                    "headers": [{"name": "Authorization", "value": "header-secret-value"}]
+                }
+            ]
+        });
+        let created = adapter.handle_session_new(json!(1), &params);
+        assert!(created.error.is_none(), "{:?}", created.error);
+        let session_id = created.result.unwrap()["sessionId"].as_str().unwrap().to_string();
+        let dir = adapter.mcp.dir_for(&session_id).unwrap().to_path_buf();
+        let config: Value = serde_json::from_str(&fs::read_to_string(dir.join("mcp_config.json")).unwrap()).unwrap();
+        assert_eq!(config["mcpServers"]["conduit"]["env"]["TOKEN"], "env-secret-value");
+        assert_eq!(config["mcpServers"]["remote"]["headers"]["Authorization"], "header-secret-value");
+        let manifest: Value = serde_json::from_str(&fs::read_to_string(dir.join("plugin.json")).unwrap()).unwrap();
+        assert_eq!(manifest["name"], dir.file_name().unwrap().to_str().unwrap());
+
+        adapter.persist_session(&session_id, Some("conv-1"), 3, None);
+        adapter.sessions.clear();
+        let loaded = adapter.handle_session_load(json!(2), &json!({
+            "sessionId": session_id,
+            "mcpServers": [{"name": "conduit", "command": "/bin/true", "args": []}]
+        }));
+        assert!(loaded.error.is_none(), "{:?}", loaded.error);
+        let config: Value = serde_json::from_str(&fs::read_to_string(dir.join("mcp_config.json")).unwrap()).unwrap();
+        assert!(config["mcpServers"].get("remote").is_none());
+        assert_eq!(config["mcpServers"]["conduit"]["command"], "/bin/true");
+
+        let closed = adapter.handle_session_close(json!(3), &json!({"sessionId": session_id}));
+        assert!(closed.error.is_none(), "{:?}", closed.error);
+        assert!(!dir.exists());
+        assert!(!adapter.sessions.contains_key(&session_id));
+    }
+
+    #[test]
+    fn session_new_rejects_sse_without_keeping_a_session() {
+        let root = TempDirGuard(std::env::temp_dir().join(format!("agy-acp-sse-{}", Uuid::new_v4())));
+        fs::create_dir_all(&*root).unwrap();
+        let mut adapter = adapter_at(&root);
+        let response = adapter.handle_session_new(json!(1), &json!({
+            "mcpServers": [{
+                "type": "sse",
+                "name": "legacy",
+                "url": "http://127.0.0.1:9/sse",
+                "headers": [{"name": "Authorization", "value": "header-secret-value"}]
+            }]
+        }));
+        let message = response.error.unwrap()["message"].as_str().unwrap().to_string();
+        assert!(message.contains("sse"));
+        assert!(!message.contains("header-secret-value"));
+        assert!(adapter.sessions.is_empty());
+        assert!(adapter.mcp.dir_for("legacy").is_none());
+        let plugins = root.join(".gemini/config/plugins");
+        if plugins.exists() {
+            assert!(fs::read_dir(&plugins).unwrap().next().is_none());
+        }
     }
 }
